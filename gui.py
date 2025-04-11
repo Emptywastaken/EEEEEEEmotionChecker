@@ -1,136 +1,72 @@
-import matplotlib.pyplot as plt
-import torch
-from collections import Counter
-from torchvision import transforms
-from PIL import Image
 import gradio as gr
-import numpy as np
-import cv2
-import io
+from predict import predict_emotion_with_progress
+from video_utils import download_youtube_segment, analyze_video
 
-from model import EmotionRecognitionCNN  # Make sure model.py is in the same directory
+def show_youtube_preview(url):
+    '''Return an embeddable iframe HTML from a YouTube link.'''
+    try:
+        video_id = url.split("v=")[-1].split("&")[0]
+        return f"""
+        <iframe width='100%' height='315' src='https://www.youtube.com/embed/{video_id}'
+        frameborder='0' allow='autoplay; encrypted-media' allowfullscreen></iframe>
+        """
+    except Exception as e:
+        return f"<p style='color:red;'>Invalid YouTube URL: {str(e)}</p>"
 
-# Emotion classes
-emotion_classes = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+with gr.Blocks() as demo:
+    gr.Markdown("### Emotion Detection from Image or YouTube Clip")
 
-# Load model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = EmotionRecognitionCNN().to(device)
-model.load_state_dict(torch.load("emotion_model3_58.pth", map_location=device))
-model.eval()
+    with gr.TabItem("Image (Upload or Webcam)"):
+        with gr.Row():
+            with gr.Column():
+                image_input = gr.Image(type="numpy", label="Upload or Capture Image")
+                image_button = gr.Button("Detect Emotion")
+            progress = gr.Textbox(label="Progress", interactive=False, visible=True)
+        emotion_output = gr.Text(label="Predicted Emotion")
 
-# Define preprocessing for image input
-transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((48, 48)),
-    transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
-])
+        image_button.click(
+            fn=predict_emotion_with_progress,
+            inputs=[image_input, progress],
+            outputs=[emotion_output]
+        )
 
-def plot_pie_chart(counter):
-    plt.figure(figsize=(6, 6))
-    plt.pie(
-        list(counter.values()),
-        labels=list(counter.keys()),
-        autopct='%1.1f%%',
-        startangle=140,
-        colors=plt.cm.Pastel1.colors
-    )
-    plt.title("Emotion Distribution (Pie Chart)")
-    plt.axis('equal')  # ensures pie is round
-    plt.tight_layout()
+    with gr.TabItem("YouTube Trim & Analyze"):
+        gr.Markdown("Paste a YouTube link OR upload a local video file")
+        youtube_url = gr.Text(label="YouTube Link", placeholder="https://www.youtube.com/watch?v=...")
+        video_file = gr.File(label="Or Upload Video File (.mp4)", file_types=[".mp4"])
+        preview_html = gr.HTML()
+        preview_btn = gr.Button("Show YouTube Preview")
+        preview_btn.click(fn=show_youtube_preview, inputs=youtube_url, outputs=preview_html)
 
+        with gr.Row():
+            start_time = gr.Text(label="Start (hh:mm:ss)", value="00:00:00")
+            end_time = gr.Text(label="End (hh:mm:ss)", value="00:00:10")
 
-def predict_by_video(video_path):
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        frame_rate_slider = gr.Slider(minimum=1, maximum=30, step=1, value=5, label="Sample Every N Seconds")
+        analyze_btn = gr.Button("Download & Analyze Clip")
+        output_bar = gr.Image(label="Bar Chart", visible=False)
+        output_pie_all = gr.Image(label="Pie Chart (All Emotions)", visible=False)
+        output_pie_non = gr.Image(label="Pie Chart (No Neutral)", visible=False)
 
-    cap = cv2.VideoCapture(video_path)
-    fps = int(cap.get(cv2.CAP_PROP_FPS)) #frames per second
-    emotion_counts = []
-    frame_index = 0
+        def full_pipeline(url, start, end, sample_every, video_file_path, progress_callback=None):
+            '''Run full processing: trim video or use uploaded, analyze emotions.'''
+            if video_file_path is not None:
+                print("[DEBUG] Using uploaded video file")
+                video_path = video_file_path
+            else:
+                video_path = download_youtube_segment(url, start, end)
+            if progress_callback:
+                progress_callback("Analyzing video...")
+            result = analyze_video(video_path, sample_every)
+            if progress_callback:
+                progress_callback("Analysis complete.")
+            return result
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_index % fps == 0:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
-            for (x, y, w, h) in faces:
-                face = gray[y:y + h, x:x + w]
-                face = cv2.resize(face, (48, 48))
-                face_tensor = transform(Image.fromarray(face)).unsqueeze(0).to(device)
-
-                with torch.no_grad():
-                    output = model(face_tensor)
-                    _, predicted = torch.max(output, 1)
-                    emotion = emotion_classes[predicted.item()]
-                    emotion_counts.append(emotion)
-                break  # predict only one face per frame for simplicity
-        frame_index += 1
-    cap.release()
-    print(emotion_counts)
-    counter = Counter(emotion_counts)
-    emotions = list(counter.keys())
-    counts = list(counter.values())
-
-    # BAR CHART
-    plt.figure(figsize=(10,5))
-    plt.bar(emotions, counts, color='pink')
-    plt.title("Emotion Frequency in Video")
-    plt.xlabel("Emotion")
-    plt.ylabel("Count")
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    img = Image.open(buf)
-    plt.close()
-
-    # PIE CHART
-    pie_buf = io.BytesIO()
-    plot_pie_chart(counter)
-    plt.savefig(pie_buf, format='png')
-    pie_buf.seek(0)
-    pie_image = Image.open(pie_buf)
-    plt.close()
-
-    return img  # return buffer to Gradio
-
-
-# Prediction function
-def predict_emotion(image_np):
-
-    # Convert NumPy array to PIL image
-    img = Image.fromarray(image_np).convert("RGB")
-    img = transform(img).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        output = model(img)
-        _, predicted = torch.max(output, 1)
-        emotion = emotion_classes[predicted.item()]
-
-    return emotion
-
-# Gradio UI
-demo = gr.Interface(
-    fn=predict_emotion,
-    inputs=gr.Image(label="Upload Face Image", type="numpy"),
-    outputs=gr.Text(label="Predicted Emotion"),
-    title="Emotion Detection",
-    description="Upload a 48x48 grayscale or color image of a face to detect the emotion."
-)
-
-video_upload = gr.Interface(
-    fn=predict_by_video,
-    inputs=gr.Video(label="Upload video"),
-    outputs=gr.Image(type="pil", label="Emotion Chart")
-)
-
-app = gr.TabbedInterface(
-    [demo, video_upload],
-    ["Image Upload", "Video Upload"]
-)
+        analyze_btn.click(
+            fn=full_pipeline,
+            inputs=[youtube_url, start_time, end_time, frame_rate_slider, video_file, progress],
+            outputs=[output_bar, output_pie_all, output_pie_non]
+        )
 
 if __name__ == "__main__":
-    app.launch(share=True)
-
+    demo.launch(share=True)
